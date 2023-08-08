@@ -8,67 +8,50 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
-use egui::plot::{HLine, Line, Plot, Value, Values};
+use egui::plot::{HLine, Line, Plot};
 use egui::{Color32, ColorImage, Ui};
 use egui_vulkano::UpdateTexturesResult;
-use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer, TypedBufferAccess};
+use egui_winit::egui::plot::{Value, Values};
+use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, SubpassContents};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo};
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
-use vulkano::image::{ImageAccess, ImageUsage, SwapchainImage};
+use vulkano::image::{Image, ImageUsage};
 use vulkano::instance::{Instance, InstanceCreateInfo};
+use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
-use vulkano::pipeline::graphics::vertex_input::BuffersDefinition;
+use vulkano::pipeline::graphics::vertex_input::{BuffersDefinition, Vertex};
 use vulkano::pipeline::graphics::viewport::Viewport;
 use vulkano::pipeline::graphics::viewport::ViewportState;
 use vulkano::pipeline::GraphicsPipeline;
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
-use vulkano::swapchain::{AcquireError, Swapchain, SwapchainCreateInfo, SwapchainCreationError};
-use vulkano::sync::{FenceSignalFuture, FlushError, GpuFuture};
-use vulkano::{swapchain, sync};
+use vulkano::swapchain::{Swapchain, SwapchainCreateInfo};
+use vulkano::sync::GpuFuture;
+use vulkano::{swapchain, sync, VulkanLibrary};
 use vulkano_win::VkSurfaceBuild;
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Fullscreen, Window, WindowBuilder};
 
-pub enum FrameEndFuture<F: GpuFuture + 'static> {
-    FenceSignalFuture(FenceSignalFuture<F>),
-    BoxedFuture(Box<dyn GpuFuture>),
-}
-
-impl<F: GpuFuture> FrameEndFuture<F> {
-    pub fn now(device: Arc<Device>) -> Self {
-        Self::BoxedFuture(sync::now(device).boxed())
-    }
-
-    pub fn get(self) -> Box<dyn GpuFuture> {
-        match self {
-            FrameEndFuture::FenceSignalFuture(f) => f.boxed(),
-            FrameEndFuture::BoxedFuture(f) => f,
-        }
-    }
-}
-
-impl<F: GpuFuture> AsMut<dyn GpuFuture> for FrameEndFuture<F> {
-    fn as_mut(&mut self) -> &mut (dyn GpuFuture + 'static) {
-        match self {
-            FrameEndFuture::FenceSignalFuture(f) => f,
-            FrameEndFuture::BoxedFuture(f) => f,
-        }
-    }
-}
-
 fn main() {
-    let required_extensions = vulkano_win::required_extensions();
-    let instance = Instance::new(InstanceCreateInfo {
-        enabled_extensions: required_extensions,
-        ..Default::default()
-    })
+    let library = VulkanLibrary::new().unwrap();
+    let required_extensions = vulkano_win::required_extensions(library.as_ref());
+    let instance = Instance::new(
+        library.clone(),
+        InstanceCreateInfo {
+            enabled_extensions: required_extensions,
+            ..Default::default()
+        },
+    )
     .unwrap();
 
-    let physical = PhysicalDevice::enumerate(&instance).next().unwrap();
+    let physical = instance
+        .enumerate_physical_devices()
+        .unwrap()
+        .next()
+        .unwrap();
 
     println!(
         "Using device: {} (type: {:?})",
@@ -77,6 +60,7 @@ fn main() {
     );
 
     let event_loop = EventLoop::new();
+
     let surface = WindowBuilder::new()
         .with_title("egui_vulkano demo")
         .with_fullscreen(Some(Fullscreen::Borderless(None)))
@@ -118,6 +102,8 @@ fn main() {
 
     let queue = queues.next().unwrap();
 
+    let memory_allocator = StandardMemoryAllocator::new_default(device.clone());
+
     let (mut swapchain, images) = {
         let caps = physical_device
             .surface_capabilities(&surface, Default::default())
@@ -143,26 +129,32 @@ fn main() {
         .unwrap()
     };
 
-    #[derive(Default, Debug, Clone, Copy, Pod, Zeroable)]
+    #[derive(Vertex, Default, Debug, Clone, Copy, Pod, Zeroable)]
     #[repr(C)]
-    struct Vertex {
+    struct SimpleVertex {
+        #[format(R32G32_SFLOAT)]
         position: [f32; 2],
     }
-    vulkano::impl_vertex!(Vertex, position);
 
     let vertex_buffer = {
-        CpuAccessibleBuffer::from_iter(
-            device.clone(),
-            BufferUsage::all(),
-            false,
+        Buffer::from_iter(
+            &memory_allocator,
+            BufferCreateInfo {
+                usage: BufferUsage::all(),
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                ..Default::default()
+            },
             [
-                Vertex {
+                SimpleVertex {
                     position: [-0.5, -0.25],
                 },
-                Vertex {
+                SimpleVertex {
                     position: [0.0, 0.5],
                 },
-                Vertex {
+                SimpleVertex {
                     position: [0.25, -0.1],
                 },
             ]
@@ -209,10 +201,10 @@ fn main() {
         device.clone(),
         attachments: {
             color: {
-                load: Clear,
-                store: Store,
                 format: swapchain.image_format(),
                 samples: 1,
+                load_op: Clear,
+                store_op: Store,
             }
         },
         passes: [
@@ -223,7 +215,7 @@ fn main() {
     .unwrap();
 
     let pipeline = GraphicsPipeline::start()
-        .vertex_input_state(BuffersDefinition::new().vertex::<Vertex>())
+        .vertex_input_state(BuffersDefinition::new().vertex::<SimpleVertex>())
         .vertex_shader(vs.entry_point("main").unwrap(), ())
         .input_assembly_state(InputAssemblyState::new())
         .viewport_state(ViewportState::viewport_dynamic_scissor_irrelevant())
@@ -328,7 +320,7 @@ fn main() {
 
                 let clear_values = vec![[0.0, 0.0, 1.0, 1.0].into()];
                 let mut builder = AutoCommandBufferBuilder::primary(
-                    device.clone(),
+                    &memory_allocator,
                     queue.family(),
                     CommandBufferUsage::OneTimeSubmit,
                 )
@@ -444,7 +436,7 @@ fn main() {
 }
 
 fn window_size_dependent_setup(
-    images: &[Arc<SwapchainImage<Window>>],
+    images: &[Arc<Image>],
     render_pass: Arc<RenderPass>,
     viewport: &mut Viewport,
 ) -> Vec<Arc<Framebuffer>> {
