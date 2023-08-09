@@ -10,26 +10,40 @@ use egui::epaint::{
     textures::TexturesDelta, ClippedPrimitive, ClippedShape, ImageData, ImageDelta, Primitive,
 };
 use egui::{Color32, Context, Rect, TextureId};
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
+use thiserror::Error;
 use vulkano::buffer::{Buffer, BufferAllocateError, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::command_buffer::SubpassContents::Inline;
+use vulkano::command_buffer::allocator::{CommandBufferAllocator, CommandBufferBuilderAlloc};
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, BufferImageCopy, CopyBufferToImageInfo, PrimaryAutoCommandBuffer,
     SubpassBeginInfo, SubpassEndInfo,
 };
+use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
 use vulkano::device::{Device, Queue};
 use vulkano::format::Format;
+use vulkano::image::sampler::{Filter, Sampler, SamplerCreateInfo, SamplerMipmapMode};
+use vulkano::image::view::ImageView;
 use vulkano::image::{
-    Image, ImageAllocateError, ImageCreateInfo, ImageSubresourceLayers, ImageUsage,
+    Image, ImageAllocateError, ImageAspects, ImageCreateInfo, ImageSubresourceLayers, ImageUsage,
+};
+use vulkano::memory::allocator::{
+    AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator,
 };
 use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, BlendFactor, ColorBlendState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
+use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
+use vulkano::pipeline::graphics::subpass::PipelineSubpassType;
+use vulkano::pipeline::graphics::vertex_input::Vertex;
+use vulkano::pipeline::graphics::vertex_input::VertexDefinition;
 use vulkano::pipeline::graphics::viewport::{Scissor, Viewport, ViewportState};
 use vulkano::pipeline::graphics::{GraphicsPipeline, GraphicsPipelineCreateInfo};
-use vulkano::pipeline::{DynamicState, PartialStateMode, PipelineBindPoint, StateMode};
+use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
+use vulkano::pipeline::{PartialStateMode, PipelineBindPoint};
 use vulkano::pipeline::{Pipeline, PipelineLayout, PipelineShaderStageCreateInfo};
+use vulkano::render_pass::Subpass;
+use vulkano::{Validated, ValidationError, VulkanError};
 
 mod shaders;
 
@@ -64,22 +78,6 @@ impl From<&egui::epaint::Vertex> for EguiVertex {
         }
     }
 }
-
-use thiserror::Error;
-use vulkano::command_buffer::allocator::{CommandBufferAllocator, CommandBufferBuilderAlloc};
-use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
-use vulkano::image::sampler::{Filter, Sampler, SamplerCreateInfo, SamplerMipmapMode};
-use vulkano::image::view::ImageView;
-use vulkano::memory::allocator::{
-    AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator,
-};
-use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::subpass::PipelineSubpassType;
-use vulkano::pipeline::graphics::vertex_input::Vertex;
-use vulkano::pipeline::graphics::vertex_input::VertexDefinition;
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::render_pass::Subpass;
-use vulkano::{Validated, ValidationError, VulkanError};
 
 #[derive(Error, Debug)]
 pub enum PainterCreationError {
@@ -220,15 +218,23 @@ impl Painter {
             Some(pos) => [pos[0] as u32, pos[1] as u32, 0],
         };
 
-        let mut info = CopyBufferToImageInfo::buffer_image(img_buffer, image.clone());
-        info.regions.push(BufferImageCopy {
-            image_offset: offset,
-            image_extent: size,
-            image_subresource: ImageSubresourceLayers::from_parameters(image.format(), 1),
-            ..Default::default()
-        });
+        let mut info = CopyBufferToImageInfo {
+            regions: smallvec![BufferImageCopy {
+                buffer_offset: 0,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: ImageSubresourceLayers {
+                    aspects: ImageAspects::COLOR,
+                    mip_level: 0,
+                    array_layers: 0..1,
+                },
+                image_offset: offset,
+                image_extent: size,
+                ..Default::default()
+            }],
+            ..CopyBufferToImageInfo::buffer_image(img_buffer, image)
+        };
         builder.copy_buffer_to_image(info)?;
-        //builder.copy_buffer_to_image_dimensions(img_buffer, image, offset, size, 0, 1, 0)?;
         Ok(())
     }
 
