@@ -10,6 +10,7 @@ use egui::epaint::{
     textures::TexturesDelta, ClippedPrimitive, ClippedShape, ImageData, ImageDelta, Primitive,
 };
 use egui::{Color32, Context, Rect, TextureId};
+use smallvec::SmallVec;
 use vulkano::buffer::{Buffer, BufferAllocateError, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::SubpassContents::Inline;
 use vulkano::command_buffer::{
@@ -19,13 +20,15 @@ use vulkano::command_buffer::{
 use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
 use vulkano::device::{Device, Queue};
 use vulkano::format::Format;
-use vulkano::image::{Image, ImageAllocateError, ImageCreateInfo, ImageUsage};
+use vulkano::image::{
+    Image, ImageAllocateError, ImageCreateInfo, ImageSubresourceLayers, ImageUsage,
+};
 use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, BlendFactor, ColorBlendState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
-use vulkano::pipeline::graphics::viewport::{Scissor, ViewportState};
+use vulkano::pipeline::graphics::viewport::{Scissor, Viewport, ViewportState};
 use vulkano::pipeline::graphics::{GraphicsPipeline, GraphicsPipelineCreateInfo};
-use vulkano::pipeline::PipelineBindPoint;
+use vulkano::pipeline::{DynamicState, PartialStateMode, PipelineBindPoint, StateMode};
 use vulkano::pipeline::{Pipeline, PipelineLayout, PipelineShaderStageCreateInfo};
 
 mod shaders;
@@ -120,8 +123,8 @@ pub enum UpdateTexturesResult {
 /// Contains everything needed to render the gui.
 pub struct Painter {
     device: Arc<Device>,
-    allocator: StandardMemoryAllocator,
-    descriptor_set_allocator: StandardDescriptorSetAllocator,
+    allocator: Arc<StandardMemoryAllocator>,
+    descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     queue: Arc<Queue>,
     /// Graphics pipeline used to render the gui.
     pub pipeline: Arc<GraphicsPipeline>,
@@ -140,12 +143,30 @@ impl Painter {
         queue: Arc<Queue>,
         subpass: Subpass,
     ) -> Result<Self, PainterCreationError> {
+        let allocator = StandardMemoryAllocator::new_default(device.clone());
+        let descriptor_set_allocator = StandardDescriptorSetAllocator::new(device.clone());
+        Self::new_with_allocators(
+            device,
+            queue,
+            subpass,
+            allocator.into(),
+            descriptor_set_allocator.into(),
+        )
+    }
+
+    /// Pass in the vulkano [`Device`], [`Queue`], [`Subpass`] and ['StandardMemoryAllocator']
+    /// that you want to use to render the gui.
+    pub fn new_with_allocators(
+        device: Arc<Device>,
+        queue: Arc<Queue>,
+        subpass: Subpass,
+        allocator: Arc<StandardMemoryAllocator>,
+        descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
+    ) -> Result<Self, PainterCreationError> {
         let pipeline = create_pipeline(device.clone(), subpass)
             .map_err(PainterCreationError::CreatePipelineFailed)?;
         let sampler =
             create_sampler(device.clone()).map_err(PainterCreationError::CreateSamplerFailed)?;
-        let allocator = StandardMemoryAllocator::new_default(device.clone());
-        let descriptor_set_allocator = StandardDescriptorSetAllocator::new(device.clone());
         Ok(Self {
             device,
             allocator,
@@ -199,10 +220,11 @@ impl Painter {
             Some(pos) => [pos[0] as u32, pos[1] as u32, 0],
         };
 
-        let mut info = CopyBufferToImageInfo::buffer_image(img_buffer, image);
+        let mut info = CopyBufferToImageInfo::buffer_image(img_buffer, image.clone());
         info.regions.push(BufferImageCopy {
             image_offset: offset,
             image_extent: size,
+            image_subresource: ImageSubresourceLayers::from_parameters(image.format(), 1),
             ..Default::default()
         });
         builder.copy_buffer_to_image(info)?;
@@ -283,7 +305,22 @@ impl Painter {
     {
         builder
             .next_subpass(SubpassEndInfo::default(), SubpassBeginInfo::default())?
-            .bind_pipeline_graphics(self.pipeline.clone())?;
+            .bind_pipeline_graphics(self.pipeline.clone())?
+            .set_viewport(
+                0,
+                match &self.pipeline.viewport_state().unwrap().viewports {
+                    PartialStateMode::Dynamic(_) => {
+                        let mut v: SmallVec<[Viewport; 2]> = SmallVec::new();
+                        v.push(Viewport {
+                            offset: [0.0, 0.0],
+                            extent: window_size_points,
+                            depth_range: 0.0..=1.0,
+                        });
+                        v
+                    }
+                    PartialStateMode::Fixed(view_ports) => view_ports.as_slice().into(),
+                },
+            )?;
 
         let clipped_primitives: Vec<ClippedPrimitive> = egui_ctx.tessellate(clipped_shapes);
         let num_meshes = clipped_primitives.len();
@@ -476,7 +513,7 @@ fn create_image<A: MemoryAllocator + ?Sized>(
         allocator,
         ImageCreateInfo {
             extent: [texture.width() as u32, texture.height() as u32, 1],
-            format: Format::R8G8B8A8_SRGB,
+            format: Format::R8G8B8A8_UNORM,
             usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED | ImageUsage::STORAGE,
             ..Default::default()
         },

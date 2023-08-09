@@ -15,6 +15,7 @@ vulkano = { git = "https://github.com/vulkano-rs/vulkano.git" }
 vulkano-shaders = { git = "https://github.com/vulkano-rs/vulkano.git" }
 bytemuck = "1.8.0"
 egui = "0.22.0"
+smallvec = "*"
 thiserror = "1.0"
 
 [dev-dependencies]
