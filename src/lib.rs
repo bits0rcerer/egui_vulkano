@@ -1,7 +1,7 @@
 //! [egui](https://docs.rs/egui) rendering backend for [Vulkano](https://docs.rs/vulkano).
 #![warn(missing_docs)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::default::Default;
 use std::sync::Arc;
 
@@ -10,37 +10,40 @@ use egui::epaint::{
     textures::TexturesDelta, ClippedPrimitive, ClippedShape, ImageData, ImageDelta, Primitive,
 };
 use egui::{Color32, Context, Rect, TextureId};
-use smallvec::{smallvec, SmallVec};
+use smallvec::smallvec;
 use thiserror::Error;
-use vulkano::buffer::{Buffer, BufferAllocateError, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::command_buffer::allocator::{CommandBufferAllocator, CommandBufferBuilderAlloc};
+use vulkano::buffer::{AllocateBufferError, Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, BufferImageCopy, CopyBufferToImageInfo, PrimaryAutoCommandBuffer,
     SubpassBeginInfo, SubpassEndInfo,
 };
-use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
-use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
-use vulkano::device::{Device, Queue};
+use vulkano::descriptor_set::allocator::{
+    StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
+};
+use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerCreateInfo, SamplerMipmapMode};
 use vulkano::image::view::ImageView;
 use vulkano::image::{
-    Image, ImageAllocateError, ImageAspects, ImageCreateInfo, ImageSubresourceLayers, ImageUsage,
+    AllocateImageError, Image, ImageAspects, ImageCreateInfo, ImageSubresourceLayers, ImageUsage,
+    SampleCount,
 };
 use vulkano::memory::allocator::{
     AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator,
 };
-use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, BlendFactor, ColorBlendState};
+use vulkano::pipeline::graphics::color_blend::{
+    AttachmentBlend, BlendFactor, ColorBlendAttachmentState, ColorBlendState,
+};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
-use vulkano::pipeline::graphics::subpass::PipelineSubpassType;
+use vulkano::pipeline::graphics::rasterization::RasterizationState;
 use vulkano::pipeline::graphics::vertex_input::Vertex;
 use vulkano::pipeline::graphics::vertex_input::VertexDefinition;
 use vulkano::pipeline::graphics::viewport::{Scissor, Viewport, ViewportState};
 use vulkano::pipeline::graphics::{GraphicsPipeline, GraphicsPipelineCreateInfo};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{PartialStateMode, PipelineBindPoint};
+use vulkano::pipeline::{DynamicState, PipelineBindPoint};
 use vulkano::pipeline::{Pipeline, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
 use vulkano::{Validated, ValidationError, VulkanError};
@@ -92,17 +95,17 @@ pub enum UpdateTexturesError {
     #[error(transparent)]
     CreateDescriptorSet(Validated<VulkanError>),
     #[error(transparent)]
-    CreateImage(#[from] Validated<ImageAllocateError>),
+    CreateImage(#[from] Validated<AllocateImageError>),
     #[error(transparent)]
     CreateImageView(Validated<VulkanError>),
     #[error(transparent)]
-    Alloc(#[from] Validated<BufferAllocateError>),
+    Alloc(#[from] Validated<AllocateBufferError>),
 }
 
 #[derive(Error, Debug)]
 pub enum DrawError {
     #[error(transparent)]
-    CreateBuffersFailed(#[from] Validated<BufferAllocateError>),
+    CreateBuffersFailed(#[from] Validated<AllocateBufferError>),
     #[error(transparent)]
     CommandBuilderValidation(#[from] Box<ValidationError>),
 }
@@ -120,32 +123,30 @@ pub enum UpdateTexturesResult {
 
 /// Contains everything needed to render the gui.
 pub struct Painter {
-    device: Arc<Device>,
     allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
-    queue: Arc<Queue>,
     /// Graphics pipeline used to render the gui.
     pub pipeline: Arc<GraphicsPipeline>,
     /// Texture sampler used to render the gui.
     pub sampler: Arc<Sampler>,
     images: HashMap<TextureId, Arc<Image>>,
-    texture_sets: HashMap<TextureId, Arc<PersistentDescriptorSet>>,
+    texture_sets: HashMap<TextureId, Arc<DescriptorSet>>,
     texture_free_queue: Vec<TextureId>,
 }
 
 impl Painter {
     /// Pass in the vulkano [`Device`], [`Queue`] and [`Subpass`]
     /// that you want to use to render the gui.
-    pub fn new(
-        device: Arc<Device>,
-        queue: Arc<Queue>,
-        subpass: Subpass,
-    ) -> Result<Self, PainterCreationError> {
+    pub fn new(device: Arc<Device>, subpass: Subpass) -> Result<Self, PainterCreationError> {
         let allocator = StandardMemoryAllocator::new_default(device.clone());
-        let descriptor_set_allocator = StandardDescriptorSetAllocator::new(device.clone());
+        let descriptor_set_allocator = StandardDescriptorSetAllocator::new(
+            device.clone(),
+            StandardDescriptorSetAllocatorCreateInfo {
+                ..Default::default()
+            },
+        );
         Self::new_with_allocators(
             device,
-            queue,
             subpass,
             allocator.into(),
             descriptor_set_allocator.into(),
@@ -156,7 +157,6 @@ impl Painter {
     /// that you want to use to render the gui.
     pub fn new_with_allocators(
         device: Arc<Device>,
-        queue: Arc<Queue>,
         subpass: Subpass,
         allocator: Arc<StandardMemoryAllocator>,
         descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
@@ -166,10 +166,8 @@ impl Painter {
         let sampler =
             create_sampler(device.clone()).map_err(PainterCreationError::CreateSamplerFailed)?;
         Ok(Self {
-            device,
             allocator,
             descriptor_set_allocator,
-            queue,
             pipeline,
             sampler,
             images: Default::default(),
@@ -178,15 +176,12 @@ impl Painter {
         })
     }
 
-    fn write_image_delta<P>(
+    fn write_image_delta(
         &mut self,
         image: Arc<Image>,
         delta: &ImageDelta,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer<P>>,
-    ) -> Result<(), Validated<BufferAllocateError>>
-    where
-        P: CommandBufferAllocator,
-    {
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ) -> Result<(), Validated<AllocateBufferError>> {
         let image_data = match &delta.image {
             ImageData::Color(image) => image
                 .pixels
@@ -200,7 +195,7 @@ impl Painter {
         };
 
         let img_buffer = Buffer::from_iter(
-            &self.allocator,
+            self.allocator.clone(),
             BufferCreateInfo {
                 usage: BufferUsage::TRANSFER_SRC,
                 ..Default::default()
@@ -218,7 +213,7 @@ impl Painter {
             Some(pos) => [pos[0] as u32, pos[1] as u32, 0],
         };
 
-        let mut info = CopyBufferToImageInfo {
+        let info = CopyBufferToImageInfo {
             regions: smallvec![BufferImageCopy {
                 buffer_offset: 0,
                 buffer_row_length: 0,
@@ -243,14 +238,11 @@ impl Painter {
     /// If the return value is [`UpdateTexturesResult::Changed`],
     /// a texture will be changed in this frame and you need to wait for the last frame to finish
     /// before submitting the command buffer for this frame.
-    pub fn update_textures<P>(
+    pub fn update_textures(
         &mut self,
         textures_delta: TexturesDelta,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer<P>>,
-    ) -> Result<UpdateTexturesResult, UpdateTexturesError>
-    where
-        P: CommandBufferAllocator,
-    {
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ) -> Result<UpdateTexturesResult, UpdateTexturesError> {
         for texture_id in textures_delta.free {
             self.texture_free_queue.push(texture_id);
         }
@@ -259,11 +251,11 @@ impl Painter {
 
         for (texture_id, delta) in &textures_delta.set {
             let image = if delta.is_whole() {
-                let image = create_image(self.queue.clone(), &self.allocator, &delta.image)?;
+                let image = create_image(self.allocator.clone(), &delta.image)?;
                 let layout = &self.pipeline.layout().set_layouts()[0];
 
-                let set = PersistentDescriptorSet::new(
-                    &self.descriptor_set_allocator,
+                let set = DescriptorSet::new(
+                    self.descriptor_set_allocator.clone(),
                     layout.clone(),
                     [WriteDescriptorSet::image_view_sampler(
                         0,
@@ -299,36 +291,26 @@ impl Painter {
     }
 
     /// Advances to the next rendering subpass and uses the [`ClippedShape`]s from [`egui::FullOutput`] to draw the gui.
-    pub fn draw<P>(
+    pub fn draw(
         &mut self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer<P>>,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         window_size_points: [f32; 2],
         egui_ctx: &Context,
         clipped_shapes: Vec<ClippedShape>,
-    ) -> Result<(), DrawError>
-    where
-        P: CommandBufferAllocator,
-    {
+    ) -> Result<(), DrawError> {
         builder
             .next_subpass(SubpassEndInfo::default(), SubpassBeginInfo::default())?
             .bind_pipeline_graphics(self.pipeline.clone())?
             .set_viewport(
                 0,
-                match &self.pipeline.viewport_state().unwrap().viewports {
-                    PartialStateMode::Dynamic(_) => {
-                        let mut v: SmallVec<[Viewport; 2]> = SmallVec::new();
-                        v.push(Viewport {
-                            offset: [0.0, 0.0],
-                            extent: window_size_points,
-                            depth_range: 0.0..=1.0,
-                        });
-                        v
-                    }
-                    PartialStateMode::Fixed(view_ports) => view_ports.as_slice().into(),
-                },
+                smallvec![Viewport {
+                    offset: [0.0, 0.0],
+                    extent: window_size_points,
+                    depth_range: 0.0..=1.0,
+                }],
             )?;
 
-        let clipped_primitives: Vec<ClippedPrimitive> = egui_ctx.tessellate(clipped_shapes);
+        let clipped_primitives: Vec<ClippedPrimitive> = egui_ctx.tessellate(clipped_shapes, 1.0);
         let num_meshes = clipped_primitives.len();
 
         let mut verts = Vec::<EguiVertex>::with_capacity(num_meshes * 4);
@@ -413,9 +395,9 @@ impl Painter {
     fn create_buffers(
         &self,
         triangles: (Vec<EguiVertex>, Vec<u32>),
-    ) -> Result<(Subbuffer<[EguiVertex]>, Subbuffer<[u32]>), Validated<BufferAllocateError>> {
+    ) -> Result<(Subbuffer<[EguiVertex]>, Subbuffer<[u32]>), Validated<AllocateBufferError>> {
         let vertex_buffer = Buffer::from_iter(
-            &self.allocator,
+            self.allocator.clone(),
             BufferCreateInfo {
                 usage: BufferUsage::TRANSFER_SRC | BufferUsage::VERTEX_BUFFER,
                 ..Default::default()
@@ -428,7 +410,7 @@ impl Painter {
         )?;
 
         let index_buffer = Buffer::from_iter(
-            &self.allocator,
+            self.allocator.clone(),
             BufferCreateInfo {
                 usage: BufferUsage::INDEX_BUFFER,
                 ..Default::default()
@@ -456,10 +438,19 @@ fn create_pipeline(
         .entry_point("main")
         .unwrap();
 
-    let mut blend = AttachmentBlend::alpha();
-    blend.src_color_blend_factor = BlendFactor::One;
-
     let pipeline = {
+        let mut blend = AttachmentBlend::alpha();
+        blend.src_color_blend_factor = BlendFactor::One;
+        blend.src_alpha_blend_factor = BlendFactor::OneMinusDstAlpha;
+        blend.dst_alpha_blend_factor = BlendFactor::One;
+        let blend_state = ColorBlendState {
+            attachments: vec![ColorBlendAttachmentState {
+                blend: Some(blend),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
         let vertex_input_state =
             [EguiVertex::per_vertex()].definition(&vs.info().input_interface)?;
         let stages = [
@@ -469,7 +460,6 @@ fn create_pipeline(
         let layout = PipelineLayout::new(
             device.clone(),
             PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                //TODO: do not unwrap
                 .into_pipeline_layout_create_info(device.clone())
                 .unwrap(),
         )?;
@@ -478,16 +468,18 @@ fn create_pipeline(
             device.clone(),
             None,
             GraphicsPipelineCreateInfo {
-                input_assembly_state: Some(InputAssemblyState::new()),
+                input_assembly_state: Some(InputAssemblyState::default()),
+                viewport_state: Some(ViewportState::default()),
                 stages: stages.into_iter().collect(),
+                rasterization_state: Some(RasterizationState::default()),
+                multisample_state: Some(MultisampleState {
+                    rasterization_samples: subpass.num_samples().unwrap_or(SampleCount::Sample1),
+                    ..Default::default()
+                }),
+                color_blend_state: Some(blend_state),
                 vertex_input_state: Some(vertex_input_state),
-                viewport_state: Some(ViewportState::viewport_dynamic_scissor_dynamic(1)),
-                rasterization_state: Some(RasterizationState::new().cull_mode(CullMode::None)),
-                multisample_state: Some(MultisampleState::default()),
-                color_blend_state: Some(
-                    ColorBlendState::new(subpass.num_color_attachments()).blend(blend),
-                ),
-                subpass: Some(PipelineSubpassType::from(subpass)),
+                dynamic_state: HashSet::from_iter([DynamicState::Viewport, DynamicState::Scissor]),
+                subpass: Some(subpass.into()),
                 ..GraphicsPipelineCreateInfo::layout(layout)
             },
         )?
@@ -510,11 +502,10 @@ fn create_sampler(device: Arc<Device>) -> Result<Arc<Sampler>, Validated<VulkanE
 }
 
 /// Create a Vulkano image for the given egui texture
-fn create_image<A: MemoryAllocator + ?Sized>(
-    queue: Arc<Queue>,
-    allocator: &A,
+fn create_image(
+    allocator: Arc<dyn MemoryAllocator>,
     texture: &ImageData,
-) -> Result<Arc<Image>, Validated<ImageAllocateError>> {
+) -> Result<Arc<Image>, Validated<AllocateImageError>> {
     Image::new(
         allocator,
         ImageCreateInfo {
